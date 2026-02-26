@@ -1,0 +1,1214 @@
+#!/usr/bin/env python3
+"""
+3D Wheelchair Sling Lift Simulation — PyBullet (Demo Edition)
+
+Simulates the assistive sling-lift device:
+  - Manual wheelchair with tubular steel frame and spoked wheels
+  - Rigid sling board sitting on the seat cushion
+  - Two linear actuators under the sling that push it up ~1 inch
+  - 1-inch lift creates clearance to pull pants through the gap
+
+Physics driven by LinearActuator / LiftController / UserLoad modules.
+PyBullet handles rendering and the interactive GUI sliders.
+
+Usage:
+    python3 wheelchair_sim_3d.py
+
+Sliders (left panel):
+    User Weight (kg)            — 40–220 kg; affects actuator load
+    Lift Target (0→1)           — 0 = down, 1 = full 1-inch lift
+    Max Force Per Actuator (N)  — lower this to see stall
+    Speed Multiplier            — 0.1× slow-motion to 4× fast
+"""
+
+import sys
+import os
+import time
+import math
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import pybullet as p
+import pybullet_data
+
+from actuator import LinearActuator
+from load import UserLoad
+from controller import LiftController
+
+
+# ── Geometry constants (metres, Z-up) ─────────────────────────────────────
+
+SEAT_H      = 0.480   # floor → seat top
+SEAT_W      = 0.460   # left/right
+SEAT_D      = 0.410   # front/back
+CUSHION_T   = 0.050
+
+BACK_H      = 0.450   # backrest height above seat
+WHEEL_R     = 0.305   # rear wheel radius (24-inch)
+WHEEL_T     = 0.038
+CASTER_R    = 0.076
+CASTER_T    = 0.024
+
+SLING_W     = 0.370
+SLING_D     = 0.350
+SLING_T     = 0.018
+
+# ── Actuator: real-world spec (PA-14 class, 1000 N, 4-inch stroke, 12/24 V)
+ACT_STROKE  = 0.1016   # 4-inch stroke  — most common practical size
+ACT_R       = 0.028    # outer body radius (~56 mm OD tube)
+ACT_BODY_H  = 0.200    # motor housing height
+ACT_SHAFT_H = 0.145    # visible shaft at full extension; > stroke for overlap
+ACT_SIDE_Y  = SEAT_W / 2 + 0.045   # Y mount: outside seat, inside wheels
+ACT_X       = 0.0      # centred front-back
+
+# Rated physics (PA-14 1000 N @ 12 V)
+ACT_MAX_VEL  = 0.010   # m/s  (10 mm/s at rated load — datasheet typical)
+ACT_MAX_ACC  = 0.040   # m/s²
+ACT_RAMP_T   = 0.60    # s    (slow worm-gear ramp)
+ACT_EFF      = 0.70    # drivetrain efficiency
+
+# Arm geometry (extends inward from shaft top over the sling)
+ARM_INNER_Y = SLING_W / 2 + 0.008
+ARM_R       = 0.012
+
+# Sling-strap attachment positions
+TIE_X_F     =  SLING_D / 2 - 0.045
+TIE_X_R     = -SLING_D / 2 + 0.045
+TIE_W       = 0.032    # nylon webbing strap width (32 mm)
+TIE_T       = 0.005    # strap thickness
+
+TUBE_R      = 0.011    # wheelchair frame tube radius
+
+# Sling tilt: rear (butt side) rises fully; front (thigh side) rises TILT_RATIO × as much
+# Creates forward nose-down tilt so butt clears the seat for pants-dressing
+TILT_RATIO  = 0.48     # 0 = full tilt, 1 = flat; 0.48 ≈ 11° at full stroke
+
+ACT_CAP_H   = 0.016   # housing top end-cap thickness
+ACT_XBRACE_Z = SEAT_H + ACT_BODY_H * 0.42   # cross-brace height on housing
+
+SLING_STRAP_W = 0.042  # nylon strap width (42 mm)
+SLING_RAIL_W  = 0.028  # side rail width  (28 mm)
+
+RULER_X     = ACT_SIDE_Y + 0.095   # X position of stroke ruler
+
+ACTUATOR_STROKE = ACT_STROKE   # back-compat alias for tests
+# ── Colour palette ─────────────────────────────────────────────────────────
+
+C_FRAME_DK  = [0.12, 0.13, 0.15, 1.0]   # near-black structural steel
+C_FRAME_MD  = [0.26, 0.28, 0.32, 1.0]   # gunmetal mid steel
+C_FRAME_LT  = [0.60, 0.64, 0.70, 1.0]   # polished chrome highlight
+
+C_TYRE      = [0.06, 0.06, 0.07, 1.0]   # near-black rubber
+C_RIM       = [0.74, 0.76, 0.80, 1.0]   # machined-aluminum rim
+C_SPOKE     = [0.48, 0.50, 0.55, 1.0]   # spoke steel
+C_HUB       = [0.30, 0.32, 0.36, 1.0]   # hub steel
+
+C_CUSHION   = [0.06, 0.08, 0.25, 0.97]  # midnight-navy seat cushion
+C_SLING_DN  = [0.05, 0.32, 0.78, 1.0]   # vivid medical blue (at rest)
+C_SLING_UP  = [0.06, 0.78, 0.44, 1.0]   # bright medical green (lifted)
+C_SLING_EDG = [0.03, 0.20, 0.52, 1.0]   # deep-blue rail edge
+
+C_ACT_IDLE  = [0.32, 0.34, 0.38, 1.0]   # idle rod (dark steel)
+C_ACT_OK    = [0.10, 0.84, 0.40, 1.0]   # bright operational green
+C_ACT_WARN  = [0.96, 0.70, 0.08, 1.0]   # amber warning
+C_ACT_DEAD  = [0.92, 0.12, 0.10, 1.0]   # bright fault red
+
+C_ARM       = [0.56, 0.59, 0.64, 1.0]   # yoke-arm chrome
+C_TIE       = [0.06, 0.28, 0.76, 1.0]   # vivid nylon-webbing blue
+C_TIE_EDGE  = [0.04, 0.16, 0.50, 1.0]   # strap border dark blue
+
+C_ACT_HOUSE = [0.80, 0.82, 0.86, 1.0]   # brushed-aluminum actuator tube
+C_ACT_MOTOR = [0.18, 0.19, 0.22, 1.0]   # dark-gunmetal motor/gearbox body
+C_ACT_ROD   = [0.30, 0.32, 0.36, 1.0]   # polished steel inner rod
+C_CAP       = [0.16, 0.17, 0.20, 1.0]   # end-cap / clevis near-black steel
+C_CABLE     = [0.04, 0.04, 0.05, 1.0]   # wiring harness near-black
+
+C_RULER     = [0.35, 0.80, 0.42]         # green stroke ruler   (3-ch RGB — debug lines)
+C_LABEL_Y   = [0.90, 0.85, 0.25]         # amber annotation text (3-ch RGB — debug text)
+
+C_FLOOR_A   = [0.08, 0.09, 0.11, 1.0]   # near-black charcoal polished floor
+C_FLOOR_B   = [0.17, 0.19, 0.22, 1.0]   # subtle grid lines
+
+
+# ── PyBullet helpers ───────────────────────────────────────────────────────
+
+def _q(roll=0.0, pitch=0.0, yaw=0.0):
+    return p.getQuaternionFromEuler([roll, pitch, yaw])
+
+
+def _box(half, pos, orn=None, color=None, mass=0):
+    orn = orn or _q()
+    col = p.createCollisionShape(p.GEOM_BOX, halfExtents=half)
+    vis = (p.createVisualShape(p.GEOM_BOX, halfExtents=half, rgbaColor=color)
+           if color else -1)
+    return p.createMultiBody(mass, col, vis, pos, orn)
+
+
+def _cyl(r, h, pos, orn=None, color=None, mass=0):
+    orn = orn or _q()
+    col = p.createCollisionShape(p.GEOM_CYLINDER, radius=r, height=h)
+    vis = (p.createVisualShape(p.GEOM_CYLINDER, radius=r, length=h, rgbaColor=color)
+           if color else -1)
+    return p.createMultiBody(mass, col, vis, pos, orn)
+
+
+def _sph(r, pos, color=None):
+    col = p.createCollisionShape(p.GEOM_SPHERE, radius=r)
+    vis = (p.createVisualShape(p.GEOM_SPHERE, radius=r, rgbaColor=color)
+           if color else -1)
+    return p.createMultiBody(0, col, vis, pos)
+
+
+# Visual-only (no collision) — for kinematic animated bodies
+
+def _vbox(half, pos, orn=None, color=None):
+    orn = orn or _q()
+    vis = (p.createVisualShape(p.GEOM_BOX, halfExtents=half, rgbaColor=color)
+           if color else -1)
+    return p.createMultiBody(0.001, -1, vis, pos, orn)
+
+
+def _vcyl(r, h, pos, orn=None, color=None):
+    orn = orn or _q()
+    vis = (p.createVisualShape(p.GEOM_CYLINDER, radius=r, length=h, rgbaColor=color)
+           if color else -1)
+    return p.createMultiBody(0.001, -1, vis, pos, orn)
+
+
+def _vsph(r, pos, color=None):
+    vis = (p.createVisualShape(p.GEOM_SPHERE, radius=r, rgbaColor=color)
+           if color else -1)
+    return p.createMultiBody(0.001, -1, vis, pos)
+
+
+def _tube(x0, y0, z0, x1, y1, z1, r=None, color=None):
+    """Draw a cylinder tube from point A to point B."""
+    r = r if r is not None else TUBE_R
+    dx, dy, dz = x1 - x0, y1 - y0, z1 - z0
+    length = math.sqrt(dx*dx + dy*dy + dz*dz)
+    if length < 1e-6:
+        return
+    cx, cy, cz = (x0+x1)/2, (y0+y1)/2, (z0+z1)/2
+    tx, ty, tz = dx/length, dy/length, dz/length
+    cos_a = tz  # dot(Z_axis, target)
+    if abs(cos_a - 1.0) < 1e-6:
+        orn = _q()
+    elif abs(cos_a + 1.0) < 1e-6:
+        orn = (1.0, 0.0, 0.0, 0.0)
+    else:
+        ax, ay = -ty, tx
+        n = math.sqrt(ax*ax + ay*ay)
+        ax, ay = ax/n, ay/n
+        a = math.acos(max(-1.0, min(1.0, cos_a)))
+        s = math.sin(a / 2)
+        orn = (ax*s, ay*s, 0.0, math.cos(a / 2))
+    _cyl(r, length, [cx, cy, cz], orn, color)
+
+
+def _move(body_id, pos, orn=None):
+    p.resetBasePositionAndOrientation(body_id, pos, orn or _q())
+
+
+def _recolor(body_id, rgba):
+    p.changeVisualShape(body_id, -1, rgbaColor=rgba)
+
+
+WHEEL_ORN = _q(math.pi / 2, 0, 0)   # lay cylinder on its side
+
+
+# ── Main simulation class ──────────────────────────────────────────────────
+
+class WheelchairLiftSim3D:
+    """
+    Interactive 3D wheelchair sling-lift simulation.
+
+    LinearActuator + LiftController + UserLoad handle all physics.
+    PyBullet provides rendering, real-time GUI, and visual feedback.
+    """
+
+    def __init__(self, headless: bool = False):
+        self._headless = headless
+        self._connect()
+
+        p.setGravity(0, 0, 0)   # physics modules own gravity
+        p.setAdditionalSearchPath(pybullet_data.getDataPath())
+
+        if not self._headless:
+            p.configureDebugVisualizer(p.COV_ENABLE_SHADOWS, 1)
+            p.configureDebugVisualizer(p.COV_ENABLE_RGB_BUFFER_PREVIEW, 0)
+            p.configureDebugVisualizer(p.COV_ENABLE_MOUSE_PICKING, 0)
+            p.resetDebugVisualizerCamera(
+                cameraDistance=1.95,
+                cameraYaw=36,
+                cameraPitch=-22,
+                cameraTargetPosition=[-0.02, 0.0, 0.66])
+
+        self._init_physics(user_mass=80.0, max_force=750.0)
+
+        self._build_floor()
+        self._build_wheelchair()
+        self._build_sling()
+        self._build_actuators()
+
+        if not self._headless:
+            self._create_sliders()
+            self._build_labels()
+            self._build_lift_indicator()
+
+        self._txt         = {}   # HUD text item IDs
+        self._arrows      = {}   # force arrow debug-line IDs
+        self._ind_line_id = -1   # animated lift-indicator line
+        self._duty_on     = 0    # frames spent actively driving
+        self._duty_total  = 0    # total frames (for duty-cycle %)
+
+
+    # ── Connection ────────────────────────────────────────────────────────
+
+    def _connect(self):
+        if self._headless:
+            self.client = p.connect(p.DIRECT)
+            return
+        try:
+            self.client = p.connect(p.GUI)
+        except Exception as exc:
+            print(f"[ERROR] Cannot open PyBullet GUI: {exc}")
+            print("Make sure a display is available (X11 / VNC / WSL).")
+            sys.exit(1)
+
+    # ── Physics init ──────────────────────────────────────────────────────
+
+    def _init_physics(self, user_mass: float, max_force: float):
+        self.user_mass = user_mass
+        self.max_force = max_force
+
+        self.act_L = LinearActuator(
+            max_force=max_force, stroke_length=ACT_STROKE,
+            max_velocity=ACT_MAX_VEL, max_acceleration=ACT_MAX_ACC,
+            acceleration_ramp_time=ACT_RAMP_T)
+        self.act_R = LinearActuator(
+            max_force=max_force, stroke_length=ACT_STROKE,
+            max_velocity=ACT_MAX_VEL, max_acceleration=ACT_MAX_ACC,
+            acceleration_ramp_time=ACT_RAMP_T)
+        self.load = UserLoad(mass=user_mass / 2.0)
+        self.ctrl = LiftController(
+            actuator=self.act_L, load=self.load,
+            kp=10.0, ki=0.12, kd=2.5,
+            position_tolerance=0.002)   # 2 mm — realistic real-world tolerance
+        # Lower ki reduces integrator windup on the long 4-inch approach.
+        # Higher kd damps overshoot when decelerating near target.
+        self.ctrl.set_target_position(0.0)
+
+    # ── Safety ────────────────────────────────────────────────────────────
+
+    def emergency_stop(self):
+        """Halt both actuators and the controller."""
+        self.ctrl.emergency_stop_triggered = True
+        self.act_L.emergency_stop()
+        self.act_R.emergency_stop()
+
+    # ── Floor ─────────────────────────────────────────────────────────────
+
+    def _build_floor(self):
+        # Near-black charcoal base — polished-showroom feel
+        _box([4.5, 4.5, 0.012], [0, 0, -0.012], color=C_FLOOR_A)
+        # Very fine grid at 50 cm intervals (barely visible — professional)
+        for i in range(-8, 9):
+            _box([4.5, 0.0010, 0.0002], [0, i * 0.50, 0.0005], color=C_FLOOR_B)
+            _box([0.0010, 4.5, 0.0002], [i * 0.50, 0, 0.0005], color=C_FLOOR_B)
+        # Brighter centre reference cross
+        C_GRID_CTR = [0.26, 0.28, 0.33, 1.0]
+        _box([4.5, 0.0022, 0.0003], [0, 0, 0.0006], color=C_GRID_CTR)
+        _box([0.0022, 4.5, 0.0003], [0, 0, 0.0006], color=C_GRID_CTR)
+
+    # ── Wheelchair frame ──────────────────────────────────────────────────
+
+    def _build_wheelchair(self):
+        sz  = SEAT_H
+        bx  = -SEAT_D / 2        # rear edge X
+        fx  =  SEAT_D / 2        # front edge X
+
+        # ── seat cushion ──────────────────────────────────────────────
+        _box([SEAT_D/2 - 0.012, SEAT_W/2 - 0.012, CUSHION_T/2],
+             [0, 0, sz - CUSHION_T/2], color=C_CUSHION)
+        # side bolsters
+        for y in (SEAT_W/2 - 0.022, -(SEAT_W/2 - 0.022)):
+            _box([SEAT_D/2 - 0.015, 0.020, CUSHION_T/2 + 0.006],
+                 [0, y, sz - CUSHION_T/2], color=C_CUSHION)
+
+        # ── seat frame rails ──────────────────────────────────────────
+        for y in (SEAT_W/2 - 0.022, -(SEAT_W/2 - 0.022)):
+            _tube(bx + 0.02, y, sz - CUSHION_T - 0.008,
+                   fx - 0.02, y, sz - CUSHION_T - 0.008, color=C_FRAME_MD)
+        _tube(-0.06, -(SEAT_W/2-0.022), sz-CUSHION_T-0.008,
+               -0.06,  (SEAT_W/2-0.022), sz-CUSHION_T-0.008, color=C_FRAME_MD)
+        _tube( 0.06, -(SEAT_W/2-0.022), sz-CUSHION_T-0.008,
+                0.06,  (SEAT_W/2-0.022), sz-CUSHION_T-0.008, color=C_FRAME_MD)
+
+        # ── main side frames ──────────────────────────────────────────
+        for y in (SEAT_W/2, -SEAT_W/2):
+            # rear vertical post
+            _tube(-0.10, y, 0.04, -0.10, y, sz - CUSHION_T - 0.015,
+                  r=TUBE_R*1.2, color=C_FRAME_DK)
+            # front vertical post
+            _tube(fx - 0.03, y, 0.04, fx - 0.03, y, sz - CUSHION_T - 0.015,
+                  r=TUBE_R*1.1, color=C_FRAME_DK)
+            # bottom rail
+            _tube(-0.10, y, 0.040, fx - 0.03, y, 0.040,
+                  r=TUBE_R, color=C_FRAME_DK)
+            # diagonal brace
+            _tube(-0.10, y, 0.040, fx - 0.03, y, sz - CUSHION_T - 0.015,
+                  r=TUBE_R*0.85, color=C_FRAME_MD)
+
+        # cross braces under seat
+        _tube(-0.10, -SEAT_W/2, 0.040, -0.10, SEAT_W/2, 0.040, color=C_FRAME_DK)
+        _tube(fx-0.03, -SEAT_W/2, 0.040, fx-0.03, SEAT_W/2, 0.040, color=C_FRAME_DK)
+
+        # ── backrest ──────────────────────────────────────────────────
+        for y in (SEAT_W/2 - 0.030, -(SEAT_W/2 - 0.030)):
+            _tube(bx+0.015, y, sz, bx+0.015, y, sz + BACK_H, color=C_FRAME_MD)
+        _tube(bx+0.015, -(SEAT_W/2-0.030), sz + BACK_H,
+               bx+0.015,  (SEAT_W/2-0.030), sz + BACK_H, color=C_FRAME_MD)
+        _tube(bx+0.015, -(SEAT_W/2-0.030), sz + BACK_H*0.55,
+               bx+0.015,  (SEAT_W/2-0.030), sz + BACK_H*0.55, color=C_FRAME_MD)
+        # upholstery panel
+        _box([0.018, SEAT_W/2 - 0.055, BACK_H/2 - 0.020],
+             [bx + 0.022, 0, sz + BACK_H/2], color=C_CUSHION)
+
+        # ── push handles ──────────────────────────────────────────────
+        handle_z = sz + BACK_H + 0.11
+        for y in (SEAT_W/2 - 0.025, -(SEAT_W/2 - 0.025)):
+            _tube(bx+0.015, y, sz + BACK_H,
+                   bx - 0.015, y, handle_z, r=TUBE_R, color=C_FRAME_MD)
+        _tube(bx-0.015, -(SEAT_W/2-0.025), handle_z,
+               bx-0.015,  (SEAT_W/2-0.025), handle_z,
+               r=TUBE_R*1.1, color=C_FRAME_LT)
+
+        # ── rear wheels ───────────────────────────────────────────────
+        wx = -0.08
+        for y in (SEAT_W/2 + 0.048, -(SEAT_W/2 + 0.048)):
+            _cyl(WHEEL_R,          WHEEL_T,        [wx, y, WHEEL_R], WHEEL_ORN, C_TYRE)
+            _cyl(WHEEL_R - 0.006,  WHEEL_T * 0.45, [wx, y, WHEEL_R], WHEEL_ORN, C_RIM)
+            _cyl(WHEEL_R * 0.82,   WHEEL_T * 0.28, [wx, y, WHEEL_R], WHEEL_ORN, C_SPOKE)
+            _cyl(0.028,            WHEEL_T * 0.80, [wx, y, WHEEL_R], WHEEL_ORN, C_HUB)
+            # 6 spokes as full-diameter cylinders crossing the hub
+            for angle_deg in range(0, 180, 30):
+                th = math.radians(angle_deg)
+                _cyl(0.004, WHEEL_R * 1.85,
+                     [wx, y, WHEEL_R], _q(0.0, th, 0.0), C_SPOKE)
+            # axle stub
+            _cyl(0.018, 0.055, [wx, y, WHEEL_R], WHEEL_ORN, C_HUB)
+
+        # ── front casters ─────────────────────────────────────────────
+        cx = fx + 0.036
+        for y in (SEAT_W/2 - 0.072, -(SEAT_W/2 - 0.072)):
+            _cyl(CASTER_R,        CASTER_T,        [cx, y, CASTER_R], WHEEL_ORN, C_TYRE)
+            _cyl(CASTER_R * 0.68, CASTER_T * 0.55, [cx, y, CASTER_R], WHEEL_ORN, C_RIM)
+            _cyl(0.016,           CASTER_T * 0.75, [cx, y, CASTER_R], WHEEL_ORN, C_HUB)
+            _tube(cx, y, CASTER_R * 2.0,
+                   cx, y, CASTER_R * 2.0 + 0.072, r=TUBE_R*0.8, color=C_FRAME_MD)
+            _tube(cx, y, CASTER_R*2.0 + 0.072,
+                   fx - 0.03, y, sz - CUSHION_T - 0.018,
+                   r=TUBE_R*0.8, color=C_FRAME_MD)
+
+        # ── armrests ──────────────────────────────────────────────────
+        arm_z = sz + 0.240
+        for y in (SEAT_W/2 + 0.020, -(SEAT_W/2 + 0.020)):
+            _box([0.185, 0.022, 0.014], [0.005, y, arm_z], color=C_FRAME_LT)
+            _tube(0.005, y, sz - 0.010, 0.005, y, arm_z - 0.014,
+                  r=TUBE_R*0.85, color=C_FRAME_MD)
+
+        # ── footrests ─────────────────────────────────────────────────
+        for y in (SEAT_W/2 - 0.095, -(SEAT_W/2 - 0.095)):
+            _tube(fx - 0.025, y, sz - CUSHION_T - 0.018,
+                   fx + 0.12, y, 0.15,
+                   r=TUBE_R, color=C_FRAME_MD)
+        _tube(fx + 0.12, -(SEAT_W/2-0.095), 0.150,
+               fx + 0.12,  (SEAT_W/2-0.095), 0.150,
+               r=TUBE_R, color=C_FRAME_MD)
+        _box([0.070, SEAT_W/2 - 0.110, 0.008],
+             [fx + 0.12, 0, 0.143], color=C_FRAME_LT)
+
+    # ── Side actuators + sling connection ────────────────────────────────
+
+    def _build_actuators(self):
+        """
+        Two vertical linear actuators, one on each side of the seat.
+
+        Modelled on a PA-14 class actuator (1000 N, 4-inch stroke, 12/24 V DC).
+
+        Each side:
+          housing  — fixed outer tube (static)
+          shaft    — inner rod, animated upward as actuator extends
+          end-cap  — clevis / mounting point at bottom
+          arm      — horizontal yoke from shaft top, extends inward to sling
+          straps   — two nylon webbing straps (front + rear) arm → sling corners
+        """
+        body_base_z        = SEAT_H
+        body_ctr_z         = body_base_z + ACT_BODY_H / 2
+        shaft_base_z       = body_base_z + ACT_BODY_H
+        self._shaft_base_z = shaft_base_z
+
+        # At rest (ext=0) the arm sits at shaft_base + shaft_h
+        arm_z0            = shaft_base_z + ACT_SHAFT_H
+        sling_top_z0      = SEAT_H + SLING_T
+        self._strap_len   = arm_z0 - sling_top_z0   # constant strap length
+
+        self._housing_ids = []
+        self._shaft_ids   = []
+        self._arm_ids     = []
+        self._strap_ids   = []   # 4 straps: L-front, L-rear, R-front, R-rear
+
+        # Motor housing height fraction (like a real PA-14: fatter bottom section)
+        motor_h = ACT_BODY_H * 0.38   # gearbox / motor end
+        tube_h  = ACT_BODY_H * 0.62   # actuator barrel
+
+        for sign, y in ((+1, ACT_SIDE_Y), (-1, -ACT_SIDE_Y)):
+
+            # ── Motor / gearbox body (darker, wider — bottom) ──────────
+            motor_cz = body_base_z + motor_h / 2
+            _cyl(ACT_R * 1.28, motor_h,
+                 [ACT_X, y, motor_cz], color=C_ACT_MOTOR)
+
+            # Mounting flange ring between motor and barrel
+            _cyl(ACT_R * 1.42, 0.012,
+                 [ACT_X, y, body_base_z + motor_h], color=C_CAP)
+
+            # Bottom clevis ear-plate + clevis pin
+            _box([0.022, 0.018, 0.030],
+                 [ACT_X, y, body_base_z - 0.030], color=C_CAP)
+            _cyl(0.006, 0.042, [ACT_X, y, body_base_z - 0.032],
+                 _q(math.pi/2, 0, 0), C_FRAME_LT)
+
+            # Side mount bracket (attaches to wheelchair frame)
+            bkt_y = y - sign * (ACT_R * 1.28 + 0.014)
+            _box([0.042, 0.013, 0.056],
+                 [ACT_X, bkt_y, motor_cz], color=C_FRAME_DK)
+            # Bracket-to-frame bolt heads (two small cylinders)
+            for dz in (-0.014, +0.014):
+                _cyl(0.005, 0.005,
+                     [ACT_X, bkt_y - sign * 0.013, motor_cz + dz],
+                     _q(math.pi/2, 0, 0), C_FRAME_LT)
+
+            # Wiring / power cable exiting motor body
+            cable_y = y + sign * ACT_R * 0.88
+            _cyl(0.007, 0.058,
+                 [ACT_X - 0.032, cable_y, body_base_z + 0.032],
+                 _q(0, math.pi * 0.38, 0), C_CABLE)
+
+            # ── Actuator barrel / tube (brushed aluminum, upper) ───────
+            tube_cz = body_base_z + motor_h + tube_h / 2
+            h = _cyl(ACT_R, tube_h,
+                     [ACT_X, y, tube_cz], color=C_ACT_HOUSE)
+            self._housing_ids.append(h)
+
+            # Top end-cap disc
+            _cyl(ACT_R * 1.14, ACT_CAP_H,
+                 [ACT_X, y, body_base_z + ACT_BODY_H + ACT_CAP_H / 2],
+                 color=C_CAP)
+
+            # ── Inner rod / shaft (animated) ───────────────────────────
+            shaft_ctr_z = shaft_base_z + ACT_SHAFT_H / 2
+            s = _vcyl(ACT_R * 0.46, ACT_SHAFT_H,
+                      [ACT_X, y, shaft_ctr_z], color=C_ACT_ROD)
+            self._shaft_ids.append(s)
+
+            # ── Horizontal yoke arm (animated, chrome) ─────────────────
+            arm_len = ACT_SIDE_Y - ARM_INNER_Y
+            arm_cy  = (y + sign * ARM_INNER_Y) / 2
+            a = _vcyl(ARM_R, arm_len,
+                      [ACT_X, arm_cy, arm_z0], _q(math.pi/2, 0, 0), C_ARM)
+            self._arm_ids.append(a)
+            # Ball joint at arm inner tip
+            _vsph(ARM_R * 1.8, [ACT_X, sign * ARM_INNER_Y, arm_z0], C_ARM)
+
+            # ── Nylon webbing suspension straps (animated) ─────────────
+            strap_ctr_z = arm_z0 - self._strap_len / 2
+            for tx in (TIE_X_F, TIE_X_R):
+                t = _vbox([TIE_W / 2, SLING_STRAP_W / 2, self._strap_len / 2],
+                          [tx, sign * ARM_INNER_Y, strap_ctr_z],
+                          color=C_TIE)
+                self._strap_ids.append(t)
+
+        # ── Structural cross-braces (span motor-body width) ────────────
+        xb_r = ACT_R * 1.28   # match motor housing radius
+        _tube(ACT_X, -ACT_SIDE_Y + xb_r, ACT_XBRACE_Z,
+              ACT_X,  ACT_SIDE_Y - xb_r, ACT_XBRACE_Z,
+              r=TUBE_R * 1.5, color=C_FRAME_DK)
+        _tube(ACT_X, -ACT_SIDE_Y + xb_r, ACT_XBRACE_Z + ACT_BODY_H * 0.38,
+              ACT_X,  ACT_SIDE_Y - xb_r, ACT_XBRACE_Z + ACT_BODY_H * 0.38,
+              r=TUBE_R * 1.2, color=C_FRAME_MD)
+
+    # ── Sling ─────────────────────────────────────────────────────────────
+
+    def _build_sling(self):
+        """
+        Sling assembly — matches a real lift sling:
+          • 3 transverse nylon straps (front, mid, rear) spanning seat width
+          • 2 longitudinal side rails connecting strap ends
+          • All parts animate upward together
+        """
+        z0 = SEAT_H + SLING_T / 2
+        self._sling_parts = []   # (body_id, x_offset, y_offset)
+
+        # ── 3 transverse nylon straps ──────────────────────────────────
+        for sx in (TIE_X_F, 0.0, TIE_X_R):
+            bid = _vbox([SLING_STRAP_W / 2, SLING_W / 2, SLING_T / 2 + 0.005],
+                        [sx, 0, z0], color=C_SLING_DN)
+            self._sling_parts.append((bid, sx, 0.0))
+
+        # ── 2 longitudinal side rails (span front-strap to rear-strap) ─
+        rail_hw = (TIE_X_F - TIE_X_R) / 2.0   # half-length of rail
+        for sy in (SLING_W / 2 - SLING_RAIL_W / 2,
+                   -(SLING_W / 2 - SLING_RAIL_W / 2)):
+            bid = _vbox([rail_hw, SLING_RAIL_W / 2, SLING_T / 2 + 0.003],
+                        [0.0, sy, z0], color=C_SLING_EDG)
+            self._sling_parts.append((bid, 0.0, sy))
+
+        # back-compat: sling_id points to first strap
+        self.sling_id     = self._sling_parts[0][0]
+        self._sling_edges = []   # now handled via _sling_parts
+
+    # ── GUI sliders ───────────────────────────────────────────────────────
+
+    def _create_sliders(self):
+        self.sl_weight = p.addUserDebugParameter(
+            "User Weight (kg)  [40 – 220]", 40, 220, 80)
+        self.sl_target = p.addUserDebugParameter(
+            "Lift Target  ( 0 = down   →   1 = full 4-inch lift )", 0.0, 1.0, 0.0)
+        self.sl_force  = p.addUserDebugParameter(
+            "Actuator Rated Force per unit (N)", 200, 3000, 1000)
+        self.sl_volts  = p.addUserDebugParameter(
+            "Supply Voltage (V)  [12 or 24]", 12, 24, 12)
+        self.sl_speed  = p.addUserDebugParameter(
+            "Sim Speed  (0.25 = slow-mo   1 = real-time   4 = fast)", 0.25, 4.0, 1.0)
+
+    # ── Static 3-D annotations ───────────────────────────────────────────
+
+    def _build_labels(self):
+        """Minimal 3-D annotations — clean enough for a live demo."""
+        # Single floating title above the device (centred)
+        p.addUserDebugText(
+            "SLING LIFT ACTUATOR SYSTEM",
+            [0.0, 0.0, SEAT_H + ACT_BODY_H + ACT_SHAFT_H + ACT_STROKE + 0.30],
+            textColorRGB=[0.90, 0.92, 0.95], textSize=1.10, lifeTime=0)
+        p.addUserDebugText(
+            "PA-14 Class  |  4-inch Stroke  |  12 / 24 V DC",
+            [0.0, 0.0, SEAT_H + ACT_BODY_H + ACT_SHAFT_H + ACT_STROKE + 0.18],
+            textColorRGB=C_LABEL_Y, textSize=0.75, lifeTime=0)
+
+    def _build_lift_indicator(self):
+        """
+        Static vertical ruler to the right of the right actuator,
+        showing the full 4-inch stroke with percentage tick marks.
+        """
+        z_bot = SEAT_H + ACT_BODY_H + ACT_SHAFT_H
+        z_top = z_bot + ACT_STROKE
+        rx    = RULER_X
+
+        # Ruler spine
+        p.addUserDebugLine([rx, 0, z_bot], [rx, 0, z_top],
+                           C_RULER, lineWidth=3, lifeTime=0)
+
+        # Tick marks and labels at 0 %, 25 %, 50 %, 75 %, 100 %
+        for frac, label in ((0.0, "0%  (down)"),
+                             (0.25, "25%"),
+                             (0.50, "50%"),
+                             (0.75, "75%"),
+                             (1.0, "100% (4 in)")):
+            zt = z_bot + frac * ACT_STROKE
+            p.addUserDebugLine([rx - 0.016, 0, zt], [rx + 0.016, 0, zt],
+                               C_RULER, lineWidth=2, lifeTime=0)
+            p.addUserDebugText(label, [rx + 0.022, 0, zt],
+                               textColorRGB=C_RULER, textSize=0.62, lifeTime=0)
+
+    # ── Per-frame visual updates ──────────────────────────────────────────
+
+    def _update_visuals(self, ext: float, stalled: bool,
+                        overloaded: bool, at_target: bool,
+                        force_per_act: float):
+        # Colour coding
+        # Shaft colour shows operational state; housing stays aluminum
+        if stalled or overloaded:
+            shaft_c = C_ACT_DEAD
+            sling_c = C_SLING_DN
+            arr_c   = [0.95, 0.15, 0.10]
+        elif at_target and ext > 0.002:
+            shaft_c = C_ACT_OK
+            sling_c = C_SLING_UP
+            arr_c   = [0.18, 0.90, 0.30]
+        elif ext > ACT_STROKE * 0.72:
+            shaft_c = C_ACT_WARN
+            sling_c = C_SLING_DN
+            arr_c   = [0.95, 0.70, 0.10]
+        elif ext > 0.002:
+            shaft_c = C_ACT_OK
+            sling_c = C_SLING_DN
+            arr_c   = [0.18, 0.90, 0.30]
+        else:
+            shaft_c = C_ACT_ROD
+            sling_c = C_SLING_DN
+            arr_c   = [0.55, 0.55, 0.60]
+        act_c = shaft_c   # kept for arm recolor
+
+        arm_z      = self._shaft_base_z + ACT_SHAFT_H + ext
+        sling_top  = SEAT_H + SLING_T + ext
+        strap_ctr  = (arm_z + sling_top) / 2
+        arm_orn    = _q(math.pi / 2, 0, 0)
+
+        # Force arrow scale: 0.05 m per 100 N, max 0.30 m
+        arrow_len = min(0.30, force_per_act / 100.0 * 0.05)
+
+        strap_idx = 0
+        for i, (sign, y) in enumerate(((+1, ACT_SIDE_Y), (-1, -ACT_SIDE_Y))):
+            # shaft rises with extension
+            shaft_ctr_z = self._shaft_base_z + ACT_SHAFT_H / 2 + ext
+            _move(self._shaft_ids[i], [ACT_X, y, shaft_ctr_z])
+            _recolor(self._shaft_ids[i],   shaft_c)
+            _recolor(self._housing_ids[i], C_ACT_HOUSE)   # always aluminum
+
+            # yoke arm rises too
+            arm_cy = (y + sign * ARM_INNER_Y) / 2
+            _move(self._arm_ids[i], [ACT_X, arm_cy, arm_z], arm_orn)
+            _recolor(self._arm_ids[i], act_c)
+
+            # webbing straps
+            for tx in (TIE_X_F, TIE_X_R):
+                _move(self._strap_ids[strap_idx],
+                      [tx, sign * ARM_INNER_Y, strap_ctr])
+                _recolor(self._strap_ids[strap_idx], C_TIE)
+                strap_idx += 1
+
+            # force arrows: green upward arrows at arm inner tips
+            tip_y  = sign * ARM_INNER_Y
+            base   = [ACT_X, tip_y, arm_z]
+            tip    = [ACT_X, tip_y, arm_z + arrow_len]
+            key    = f'arr{i}'
+            if key in self._arrows:
+                p.addUserDebugLine(base, tip, arr_c, lineWidth=4,
+                                   replaceItemUniqueId=self._arrows[key])
+            else:
+                self._arrows[key] = p.addUserDebugLine(
+                    base, tip, arr_c, lineWidth=4, lifeTime=0)
+
+        # sling assembly (straps + rails)
+        sz = SEAT_H + SLING_T / 2 + ext
+        for bid, ox, oy in self._sling_parts:
+            _move(bid, [ox, oy, sz])
+            _recolor(bid, sling_c)
+
+        # lift-position indicator dot on the ruler
+        z_bot = self._shaft_base_z + ACT_SHAFT_H
+        z_ind = z_bot + ext
+        rx    = RULER_X
+        ind_from = [rx, 0, z_ind]
+        ind_to   = [rx - 0.032, 0, z_ind]
+        if self._ind_line_id >= 0:
+            self._ind_line_id = p.addUserDebugLine(
+                ind_from, ind_to, [1.0, 0.85, 0.0], lineWidth=5,
+                replaceItemUniqueId=self._ind_line_id, lifeTime=0)
+        else:
+            self._ind_line_id = p.addUserDebugLine(
+                ind_from, ind_to, [1.0, 0.85, 0.0], lineWidth=5, lifeTime=0)
+
+    def _update_hud(self, user_mass, ext_m, pwm, cap_force_each,
+                    stalled, overloaded, at_target, supply_v, duty_pct):
+        """Engineering panel — everything needed to buy and build this."""
+        GRAVITY     = 9.81
+        SAFETY_F    = 2.0
+        total_grav  = user_mass * GRAVITY
+        per_act_req = total_grav / 2.0
+        per_act_des = per_act_req * SAFETY_F
+        pct_cap     = min(100.0, per_act_req / max(cap_force_each, 1.0) * 100.0)
+
+        # Recommended actuator rating (next standard size above design load)
+        std_ratings = [200, 350, 500, 750, 1000, 1500, 2000, 3000]
+        rec_rating  = next((r for r in std_ratings if r >= per_act_des), 3000)
+
+        # Performance
+        ext_in       = ext_m / 0.0254
+        stroke_in    = ACT_STROKE / 0.0254
+        time_to_full = ACT_STROKE / ACT_MAX_VEL
+
+        # Lift progress bar
+        pct_lift  = min(1.0, ext_m / max(ACT_STROKE, 1e-9))
+        filled    = int(round(pct_lift * 12))
+        bar       = "\u2588" * filled + "\u2591" * (12 - filled)
+        bar_label = f"  [{bar}]  {pct_lift*100:4.1f}%"
+
+        # Electrical (at rated load)
+        power_w   = per_act_req * ACT_MAX_VEL / ACT_EFF   # W per actuator
+        current_a = power_w / max(supply_v, 1.0)           # A per actuator
+        total_i   = current_a * 2                          # both actuators
+
+        # Wire gauge recommendation (2× for safety margin on continuous run)
+        wire_i = total_i * 2.0
+        if   wire_i <  3.0: awg = "AWG 20"
+        elif wire_i <  5.0: awg = "AWG 18"
+        elif wire_i < 10.0: awg = "AWG 16"
+        elif wire_i < 15.0: awg = "AWG 14"
+        elif wire_i < 20.0: awg = "AWG 12"
+        else:                awg = "AWG 10"
+
+        # Status
+        if stalled or overloaded:
+            status, sc = "OVERLOADED  —  ACTUATORS STALLED", [1.00, 0.12, 0.08]
+        elif at_target and ext_m > 0.003:
+            status, sc = "AT TARGET  —  Holding",            [0.18, 0.90, 0.36]
+        elif self.ctrl.target_position > 0.003 and \
+                ext_m < self.ctrl.target_position - 0.003:
+            status, sc = "LIFTING  …",                       [0.35, 0.78, 1.00]
+        elif self.ctrl.target_position < 0.003 and ext_m > 0.003:
+            status, sc = "LOWERING  …",                      [1.00, 0.65, 0.12]
+        else:
+            status, sc = "STANDBY  —  Ready",                [0.58, 0.60, 0.65]
+
+        W   = [0.93, 0.93, 0.93]
+        DIM = [0.42, 0.44, 0.48]
+        YLW = [1.00, 0.82, 0.22]
+        RED = [1.00, 0.32, 0.12]
+        GRN = [0.30, 0.92, 0.45]
+        CYN = [0.30, 0.88, 0.95]
+        force_c = RED if pct_cap > 90 else (YLW if pct_cap > 70 else W)
+        pwm_c   = RED if stalled else GRN
+        duty_c  = RED if duty_pct > 25 else (YLW if duty_pct > 18 else GRN)
+
+        tx = 0.56
+        z0 = SEAT_H + ACT_BODY_H + ACT_SHAFT_H + ACT_STROKE + 0.38
+
+        lines = [
+            # ── header ────────────────────────────────────────────────
+            ("\u2550" * 36,
+             DIM,  0.80, z0 + 0.14),
+            ("  SLING LIFT ACTUATOR SYSTEM",
+             [0.92, 0.94, 0.98], 1.15, z0 + 0.04),
+            ("\u2550" * 36,
+             DIM,  0.80, z0 - 0.06),
+            # ── operational status ────────────────────────────────────
+            (status,
+             sc,   1.30, z0 - 0.17),
+            ("\u2500" * 36,
+             DIM,  0.78, z0 - 0.28),
+            # ── lift progress ─────────────────────────────────────────
+            ("LIFT PROGRESS",
+             W,    0.95, z0 - 0.39),
+            (bar_label,
+             CYN,  1.05, z0 - 0.49),
+            (f"  {ext_in:.3f} in  \u2192  {ext_m*1000:.1f} mm  "
+             f"of {stroke_in:.0f} in stroke",
+             W,    0.95, z0 - 0.59),
+            ("\u2500" * 36,
+             DIM,  0.78, z0 - 0.69),
+            # ── load analysis ─────────────────────────────────────────
+            ("LOAD ANALYSIS",
+             W,    0.95, z0 - 0.80),
+            (f"  User weight    {user_mass:>5.0f} kg  "
+             f"({user_mass*2.205:.0f} lb)",
+             W,    1.00, z0 - 0.90),
+            (f"  Gravity force  {total_grav:>5.0f} N  total",
+             force_c, 1.00, z0 - 1.00),
+            (f"  Per actuator   {per_act_req:>5.0f} N  "
+             f"({pct_cap:.0f}% of rated {cap_force_each:.0f} N)",
+             force_c, 1.00, z0 - 1.10),
+            (f"  2\u00d7 safety     {per_act_des:>5.0f} N  "
+             f"\u2192 specify \u2265 {rec_rating} N",
+             YLW,  1.00, z0 - 1.20),
+            ("\u2500" * 36,
+             DIM,  0.78, z0 - 1.30),
+            # ── electrical ────────────────────────────────────────────
+            (f"ELECTRICAL  \u2014  {supply_v:.0f} V DC",
+             W,    0.95, z0 - 1.41),
+            (f"  Per actuator   {power_w:>5.1f} W   {current_a:.2f} A",
+             W,    1.00, z0 - 1.51),
+            (f"  Both actuators {power_w*2:>5.1f} W   {total_i:.2f} A",
+             W,    1.00, z0 - 1.61),
+            (f"  Min wire gauge  {awg}  (60 \u00b0C, 2\u00d7 safety)",
+             CYN,  1.00, z0 - 1.71),
+            (f"  Live duty cycle {duty_pct:>4.1f}%  (spec \u2264 25%)",
+             duty_c, 1.00, z0 - 1.81),
+            ("\u2500" * 36,
+             DIM,  0.78, z0 - 1.91),
+            # ── procurement spec ──────────────────────────────────────
+            ("PROCUREMENT SPEC",
+             GRN,  0.95, z0 - 2.02),
+            (f"  Force  \u2265 {rec_rating} N      "
+             f"Stroke  {stroke_in:.0f} in     {supply_v:.0f} V DC",
+             GRN,  1.00, z0 - 2.12),
+            (f"  Speed  \u2265 {ACT_MAX_VEL*1000:.0f} mm/s    "
+             f"Enclosure  IP54 or better",
+             GRN,  1.00, z0 - 2.22),
+            (f"  e.g.  Progressive Automations PA-14",
+             DIM,  0.88, z0 - 2.32),
+            (f"        Firgelli Automations FA-PO series",
+             DIM,  0.88, z0 - 2.41),
+            ("\u2500" * 36,
+             DIM,  0.78, z0 - 2.50),
+            # ── live telemetry ────────────────────────────────────────
+            (f"  PWM  {pwm:>+.3f}     "
+             f"{'STALLED' if stalled else 'running'}",
+             pwm_c, 1.00, z0 - 2.60),
+        ]
+
+        for key, (text, color, size, z) in enumerate(lines):
+            kw = dict(text=text, textPosition=[tx, 0, z],
+                      textColorRGB=color, textSize=size, lifeTime=0)
+            if key in self._txt:
+                kw['replaceItemUniqueId'] = self._txt[key]
+            self._txt[key] = p.addUserDebugText(**kw)
+
+    # ── Main run loop ─────────────────────────────────────────────────────
+
+    def run(self):
+        print()
+        print("=" * 64)
+        print("  WHEELCHAIR SLING LIFT — 3D Demo")
+        print("=" * 64)
+        print("  Two side-mounted linear actuators lift the sling.")
+        print()
+        print("  Sliders (left panel):")
+        print("    User Weight   — sets load; HUD shows required force")
+        print("    Lift Target   — 0 = down, 1 = full 4-inch lift")
+        print("    Max Force     — reduce to see actuator stall (red)")
+        print("    Supply Volt   — 12 V or 24 V (affects current calc)")
+        print("    Sim Speed     — 0.25 = slow-motion, 1 = real-time, 4 = fast")
+        print()
+        print("  Ruler (right side): shows 0–100% stroke with live marker.")
+        print("  HUD: load, progress bar, electrical, wire gauge, buy spec.")
+        print("=" * 64)
+        print()
+
+        BASE_DT     = 0.01    # physics timestep (100 Hz base)
+        RENDER_EVERY = 2      # render every Nth physics step
+
+        prev_weight  = -1.0
+        prev_force   = -1.0
+        step         = 0
+        duty_window  = 200    # frames in rolling duty-cycle window
+
+        try:
+            while p.isConnected():
+                t0 = time.perf_counter()
+
+                # ── read sliders ──────────────────────────────────────
+                user_mass  = p.readUserDebugParameter(self.sl_weight)
+                target_in  = p.readUserDebugParameter(self.sl_target)
+                max_force  = p.readUserDebugParameter(self.sl_force)
+                supply_v   = p.readUserDebugParameter(self.sl_volts)
+                speed_mult = p.readUserDebugParameter(self.sl_speed)
+
+                target_m = target_in * ACT_STROKE
+
+                # ── sync physics params when sliders change ───────────
+                if abs(user_mass - prev_weight) > 0.05:
+                    self.load.set_mass(user_mass / 2.0)
+                    prev_weight = user_mass
+
+                if abs(max_force - prev_force) > 0.5:
+                    self.act_L.max_force = max_force
+                    self.act_R.max_force = max_force
+                    prev_force = max_force
+
+                if abs(target_m - self.ctrl.target_position) > 0.0001:
+                    clamped = max(0.0, min(target_m, ACT_STROKE))
+                    if not self.ctrl.set_target_position(clamped):
+                        self.ctrl.set_target_position(0.0)
+
+                # ── how many physics steps this frame ─────────────────
+                # speed_mult > 1 → run multiple steps per frame (fast)
+                # speed_mult < 1 → one step but sleep longer (slow)
+                n_steps = max(1, round(speed_mult))
+
+                for _ in range(n_steps):
+                    req_force = self.load.get_required_force(
+                        self.act_L.acceleration)
+                    pwm       = self.ctrl.update(BASE_DT)
+                    self.act_L.set_pwm(pwm)
+                    self.act_R.set_pwm(pwm)
+                    self.act_L.step(BASE_DT, req_force)
+                    self.act_R.step(BASE_DT, req_force)
+                    p.stepSimulation()
+
+                    # duty-cycle counter (is the actuator actively driving?)
+                    self._duty_total += 1
+                    if abs(pwm) > 0.02 and not self.act_L.stalled:
+                        self._duty_on += 1
+
+                ext        = (self.act_L.position + self.act_R.position) / 2.0
+                stalled    = self.act_L.stalled or self.act_R.stalled
+                overloaded = self.ctrl.overload_detected
+                at_target  = self.ctrl.at_target()
+
+                # rolling duty cycle (last N frames)
+                window = max(1, duty_window)
+                if self._duty_total > window * 3:
+                    self._duty_on    = int(self._duty_on    * window / self._duty_total)
+                    self._duty_total = window
+                duty_pct = self._duty_on / max(1, self._duty_total) * 100.0
+
+                # ── render every RENDER_EVERY steps ──────────────────
+                step += 1
+                if step % RENDER_EVERY == 0:
+                    self._update_visuals(ext, stalled, overloaded, at_target,
+                                         force_per_act=req_force)
+                    self._update_hud(
+                        user_mass      = user_mass,
+                        ext_m          = ext,
+                        pwm            = pwm,
+                        cap_force_each = max_force,
+                        stalled        = stalled,
+                        overloaded     = overloaded,
+                        at_target      = at_target,
+                        supply_v       = supply_v,
+                        duty_pct       = duty_pct)
+
+                # ── real-time pacing ─────────────────────────────────
+                frame_real_dt = BASE_DT * n_steps / speed_mult
+                elapsed       = time.perf_counter() - t0
+                slack         = frame_real_dt - elapsed
+                if slack > 0:
+                    time.sleep(slack)
+
+        except KeyboardInterrupt:
+            print("\nSimulation stopped.")
+        finally:
+            if p.isConnected():
+                p.disconnect()
+
+
+    # ── Automated demo ────────────────────────────────────────────────────
+
+    def run_demo(self):
+        """
+        Self-running demo — no slider interaction needed.
+
+        Cycles through 4 weight scenarios automatically at 5× real-time
+        so every lift, hold, and lower is clearly visible.
+
+        Scenarios:
+          1. Light user   (60 kg / 132 lb)  — lifts easily
+          2. Standard user (80 kg / 176 lb) — nominal design case
+          3. Heavy user  (130 kg / 286 lb)  — high-force actuator needed
+          4. Overload test (180 kg, low rated force) — intentional stall
+        """
+        SCENARIOS = [
+            {"label": "LIGHT USER",      "mass_kg":  60, "force": 1000},
+            {"label": "STANDARD USER",   "mass_kg":  80, "force": 1000},
+            {"label": "HEAVY USER",      "mass_kg": 130, "force": 1500},
+            {"label": "OVERLOAD TEST",   "mass_kg": 180, "force":  500},
+        ]
+        DEMO_STEPS  = 5       # physics steps per wall-clock frame → 5× real-time
+        BASE_DT     = 0.01
+        HOLD_TOP_S  = 3.0     # wall-clock seconds to hold at full extension
+        HOLD_BTM_S  = 1.8     # wall-clock seconds between scenarios
+
+        si          = 0
+        phase       = "LIFTING"
+        hold_start  = None
+        demo_txt    = {}
+        step        = 0
+
+        z_top = SEAT_H + ACT_BODY_H + ACT_SHAFT_H + ACT_STROKE + 0.55
+        tx    = 0.55
+
+        # z positions for each HUD row (top → bottom)
+        Zs = [z_top + 0.17,   # 0  top border
+              z_top + 0.07,   # 1  title
+              z_top - 0.04,   # 2  scenario counter
+              z_top - 0.14,   # 3  mid border
+              z_top - 0.28,   # 4  scenario label  (big)
+              z_top - 0.40,   # 5  mass
+              z_top - 0.52,   # 6  divider
+              z_top - 0.61,   # 7  phase indicator (big)
+              z_top - 0.73,   # 8  progress bar
+              z_top - 0.83,   # 9  lift measurement
+              z_top - 0.95,   # 10 divider
+              z_top - 1.04,   # 11 FORCE CALC header
+              z_top - 1.14,   # 12 total gravity
+              z_top - 1.24,   # 13 per actuator
+              z_top - 1.34,   # 14 rated / OK
+              z_top - 1.45,   # 15 bottom border
+              ]
+
+        def _reset_and_load(idx):
+            s = SCENARIOS[idx % len(SCENARIOS)]
+            self.load.set_mass(s["mass_kg"] / 2.0)
+            self.act_L.max_force = s["force"]
+            self.act_R.max_force = s["force"]
+            for act in (self.act_L, self.act_R):
+                act.stalled            = False
+                act.velocity           = 0.0
+                act.acceleration       = 0.0
+                act.pwm_input          = 0.0
+                act.emergency_stopped  = False
+            self.ctrl.overload_detected        = False
+            self.ctrl.emergency_stop_triggered = False
+            self.ctrl.integral_error           = 0.0
+            self.ctrl.last_error               = 0.0
+            self.ctrl.set_target_position(ACT_STROKE)
+            return s
+
+        def _demo_hud(s, ph, ext, stalled, overload, idx):
+            total  = len(SCENARIOS)
+            mass   = s["mass_kg"]
+            lbs    = mass * 2.205
+            force  = mass * 9.81
+            per    = force / 2.0
+            pct    = min(1.0, ext / max(ACT_STROKE, 1e-9))
+            filled = int(round(pct * 14))
+            bar    = "\u2588" * filled + "\u2591" * (14 - filled)
+            ext_in = ext / 0.0254
+            force_ok = per <= s["force"]
+
+            if stalled or overload:
+                ph_str = "\u26a0  STALL / OVERLOAD"
+                pc = [1.00, 0.15, 0.10]
+            elif ph == "LIFTING":
+                ph_str = "\u2191  LIFTING"
+                pc = [0.28, 0.86, 0.95]
+            elif ph == "HOLD_UP":
+                ph_str = "\u25a0  HOLDING AT TOP"
+                pc = [0.28, 0.92, 0.44]
+            elif ph == "LOWERING":
+                ph_str = "\u2193  LOWERING"
+                pc = [1.00, 0.64, 0.12]
+            else:
+                ph_str = "\u22ef  STANDBY"
+                pc = [0.50, 0.52, 0.58]
+
+            W   = [0.94, 0.94, 0.96]
+            DIM = [0.34, 0.36, 0.42]
+            YLW = [1.00, 0.84, 0.18]
+            GRN = [0.24, 0.90, 0.44]
+            CYN = [0.24, 0.82, 0.94]
+            RED = [1.00, 0.20, 0.10]
+
+            rows = [
+                ("\u2550" * 30,                         DIM, 0.78),   # 0
+                ("  SLING LIFT \u2014 AUTO DEMO",  [0.92, 0.94, 0.98], 1.08),  # 1
+                (f"  Scenario  {idx+1} / {total}",      W,   0.88),   # 2
+                ("\u2550" * 30,                         DIM, 0.78),   # 3
+                (f"  {s['label']}",                     YLW, 1.30),   # 4
+                (f"  {mass:.0f} kg  \u2014  {lbs:.0f} lb", W, 1.05), # 5
+                ("\u2500" * 30,                         DIM, 0.72),   # 6
+                (ph_str,                                pc,  1.18),   # 7
+                (f"  [{bar}]  {pct*100:4.1f}%",         CYN, 1.05),  # 8
+                (f"  Lift  {ext_in:.3f} in"
+                 f"  \u2192  {ext*1000:.1f} mm",        W,   0.92),   # 9
+                ("\u2500" * 30,                         DIM, 0.72),   # 10
+                ("  FORCE CALCULATION",                 W,   0.88),   # 11
+                (f"  Total gravity   {force:>6.0f} N",  W,   0.92),   # 12
+                (f"  Per actuator    {per:>6.0f} N",    W,   0.92),   # 13
+                (f"  Actuator rated  {s['force']:>6} N"
+                 f"  ({'  OK  ' if force_ok else 'EXCEEDED'})",
+                 GRN if force_ok else RED, 0.92),                     # 14
+                ("\u2550" * 30,                         DIM, 0.78),   # 15
+            ]
+
+            for key, (text, color, size) in enumerate(rows):
+                kw = dict(text=text, textPosition=[tx, 0, Zs[key]],
+                          textColorRGB=color, textSize=size, lifeTime=0)
+                if key in demo_txt:
+                    kw["replaceItemUniqueId"] = demo_txt[key]
+                demo_txt[key] = p.addUserDebugText(**kw)
+
+        # ── bootstrap ──────────────────────────────────────────────────
+        cur = _reset_and_load(si)
+
+        print()
+        print("=" * 56)
+        print("  SLING LIFT ACTUATOR SYSTEM — AUTO DEMO  (5× speed)")
+        print("=" * 56)
+        for i, s in enumerate(SCENARIOS):
+            needed = s["mass_kg"] * 9.81 / 2
+            ok     = "OK" if needed <= s["force"] else "will STALL"
+            print(f"  {i+1}. {s['label']:16s}  {s['mass_kg']:3} kg  "
+                  f"need {needed:.0f} N  rated {s['force']} N  [{ok}]")
+        print("=" * 56)
+        print()
+
+        try:
+            while p.isConnected():
+                t0 = time.perf_counter()
+
+                # ── 5 physics steps per frame ──────────────────────────
+                for _ in range(DEMO_STEPS):
+                    req = self.load.get_required_force(self.act_L.acceleration)
+                    pwm = self.ctrl.update(BASE_DT)
+                    self.act_L.set_pwm(pwm)
+                    self.act_R.set_pwm(pwm)
+                    self.act_L.step(BASE_DT, req)
+                    self.act_R.step(BASE_DT, req)
+                    p.stepSimulation()
+
+                ext      = (self.act_L.position + self.act_R.position) / 2.0
+                stalled  = self.act_L.stalled or self.act_R.stalled
+                overload = self.ctrl.overload_detected
+                at_tgt   = self.ctrl.at_target()
+
+                # ── state machine ──────────────────────────────────────
+                if phase == "LIFTING":
+                    if at_tgt or stalled or overload:
+                        phase      = "HOLD_UP"
+                        hold_start = time.perf_counter()
+                        tag = "STALLED" if (stalled or overload) else "AT TOP"
+                        print(f"  [{cur['label']:16s}]  {cur['mass_kg']:3} kg  "
+                              f"{tag:8}  {ext*1000:.1f} mm  "
+                              f"need {cur['mass_kg']*9.81/2:.0f} N  "
+                              f"rated {cur['force']} N")
+
+                elif phase == "HOLD_UP":
+                    if time.perf_counter() - hold_start >= HOLD_TOP_S:
+                        phase = "LOWERING"
+                        # Clear stall so actuator can retract
+                        for act in (self.act_L, self.act_R):
+                            act.stalled = False
+                        self.ctrl.overload_detected = False
+                        self.ctrl.set_target_position(0.0)
+
+                elif phase == "LOWERING":
+                    if ext < 0.003 and at_tgt:
+                        phase      = "HOLD_DOWN"
+                        hold_start = time.perf_counter()
+
+                elif phase == "HOLD_DOWN":
+                    if time.perf_counter() - hold_start >= HOLD_BTM_S:
+                        si  = (si + 1) % len(SCENARIOS)
+                        cur = _reset_and_load(si)
+                        phase = "LIFTING"
+                        print(f"  → Scenario {si+1}: {cur['label']}"
+                              f"  {cur['mass_kg']} kg")
+
+                # ── render ─────────────────────────────────────────────
+                if not p.isConnected():
+                    break
+                step += 1
+                if step % 2 == 0:
+                    try:
+                        self._update_visuals(ext, stalled, overload, at_tgt,
+                                             force_per_act=req)
+                        _demo_hud(cur, phase, ext, stalled, overload, si)
+                    except Exception:
+                        break   # window closed mid-frame
+
+                # ── real-time pacing (target 100 Hz wall clock) ────────
+                elapsed = time.perf_counter() - t0
+                slack   = BASE_DT - elapsed
+                if slack > 0:
+                    time.sleep(slack)
+
+        except KeyboardInterrupt:
+            print("\n  Demo stopped.")
+        finally:
+            try:
+                if p.isConnected():
+                    p.disconnect()
+            except Exception:
+                pass
+
+
+# ── Entry point ────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    sim = WheelchairLiftSim3D()
+    sim.run_demo()
