@@ -4,46 +4,62 @@ import sys
 from UI.Terminal_UI import prompt_mode, show_mode_screen
 
 def main() -> None:
-    selected_from_ui = len(sys.argv) <= 1
-    mode = sys.argv[1].lower() if len(sys.argv) > 1 else prompt_mode(default="demo")
-    if selected_from_ui:
-        show_mode_screen(mode)
+    arg_mode = sys.argv[1].lower() if len(sys.argv) > 1 else None
+    selected_from_ui = arg_mode is None
 
-    if mode == "demo":
-        try:
-            sim = WheelchairLiftSim3D()
-            sim.run_demo()
-        except KeyboardInterrupt:
-            pass
-        return
+    while True:
+        mode = arg_mode if arg_mode is not None else prompt_mode(default="demo")
 
-    if mode == "interactive":
-        sim = WheelchairLiftSim3D()
-        sim.run()
-        return
+        if selected_from_ui:
+            show_mode_screen(mode)
 
-    if mode == "serial":
-        from serial_bridge import SerialSimulationBridge
+        if mode == "demo":
+            try:
+                sim = WheelchairLiftSim3D()
+                sim.run_demo()
+            except KeyboardInterrupt:
+                pass
+            if arg_mode is not None:
+                break
+            continue
 
-        bridge = SerialSimulationBridge(
-            sim_factory=WheelchairLiftSim3D,
-            stroke_length=ACT_STROKE,
-            serial_port="COM3",
-            baudrate=115200,
-            dt=1.0 / 240.0,
-            headless=False,
-        )
-        try:
-            bridge.start()
-        except KeyboardInterrupt:
-            pass
-        finally:
-            bridge.stop()
-        return
-    if mode == "quit":
-        return
+        if mode == "interactive":
+            try:
+                sim = WheelchairLiftSim3D()
+                sim.run()
+            except KeyboardInterrupt:
+                pass
+            if arg_mode is not None:
+                break
+            continue
 
-    print("Usage: python wheelchair_sim_3d.py [demo|interactive|serial]")
+        if mode == "serial":
+            from serial_bridge import SerialSimulationBridge
+
+            bridge = SerialSimulationBridge(
+                sim_factory=WheelchairLiftSim3D,
+                stroke_length=ACT_STROKE,
+                serial_port="COM3",
+                baudrate=115200,
+                dt=1.0 / 240.0,
+                headless=False,
+            )
+            try:
+                bridge.start()
+            except KeyboardInterrupt:
+                pass
+            finally:
+                bridge.stop()
+            if arg_mode is not None:
+                break
+            continue
+
+        if mode == "quit":
+            break
+
+        print("Usage: python main.py [demo|interactive|serial|quit]")
+        if arg_mode is not None:
+            break
 
 
 if __name__ == "__main__":

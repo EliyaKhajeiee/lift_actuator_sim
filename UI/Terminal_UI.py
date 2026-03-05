@@ -6,6 +6,7 @@ from rich.text import Text
 from pyfiglet import Figlet
 
 from .Demo_screen_ui import show_demo_screen
+from .interactive_screen_ui import show_interactive_screen
 
 
 MODES = ("demo", "interactive", "serial", "quit")
@@ -54,9 +55,6 @@ def _show_title_screen(console: Console, title: str, subtitle: str, border_style
         )
     )
 
-
-def show_interactive_screen() -> None:
-    _show_title_screen(Console(), "INTERACTIVE MODE", "Running manual simulation loop...")
 
 
 def show_serial_screen() -> None:
